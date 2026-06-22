@@ -1,0 +1,20 @@
+version: "3.9"
+
+# MVP compose — runs only the Rust backend + data volume.
+# No postgres/redis/inference needed for Phase 1 tick replay.
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    container_name: hft_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TICK_DATA_PATH=/app/data/ticks.csv
+      - PLAYBACK_SPEED=${PLAYBACK_SPEED:-100.0}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      - ../data:/app/data:ro
