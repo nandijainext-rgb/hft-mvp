@@ -1,2 +1,19 @@
+# Data
 data/
 *.csv
+
+# Rust
+target/
+backend/target/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Environment
+.env
+
+# VS Code
+.vscode/
