@@ -1,98 +1,119 @@
 # HFT AI Signal Engine
 
-This project is a small service that looks at market features, asks an AI model what the next trading signal should be, and returns one of three answers:
+This project is a Rust + ONNX + Redis MVP for generating AI-assisted high-frequency trading signals. It accepts market feature data, runs an ONNX model, applies a confidence rule, stores the result, and exposes the signal through a REST API and a simple browser dashboard.
 
-- `BUY`: the model is confident price may move up.
-- `SELL`: the model is confident price may move down.
-- `HOLD`: the model is not confident enough, so do nothing.
+It returns one of three signals:
 
-Think of it as a decision helper. It does not place trades by itself. It only creates signals that another system or a person can review.
+- `BUY`: the model expects upward movement with enough confidence.
+- `SELL`: the model expects downward movement with enough confidence.
+- `HOLD`: the model is unsure or the confidence threshold was not met.
 
-## What This App Does
+This project does not place trades. It is a signal engine and dashboard only.
 
-1. Loads an AI model from `models/best_model.onnx`.
-2. Loads a scaler from `models/scaler.json` so incoming numbers are prepared the same way as training data.
-3. Connects to Redis, which is a fast temporary storage service.
-4. Starts a web server on port `8080`.
-5. Accepts market feature data through `/predict`.
-6. Returns a trading signal and saves the latest signal.
+## Install Links
 
-## Phase-by-Phase Structure
+Install these before running the full project:
 
-The project is built in phases. Each phase adds one layer to the trading system.
+| Tool | Why It Is Needed | Link |
+|------|------------------|------|
+| Git | Clone or manage the repository | https://git-scm.com/downloads |
+| Rust | Build and run the backend | https://www.rust-lang.org/tools/install |
+| Microsoft C++ Build Tools | Required by Rust on Windows MSVC | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
+| Python 3 | Export/create model artifacts and features | https://www.python.org/downloads/ |
+| Docker Desktop | Easiest way to run Redis locally | https://www.docker.com/products/docker-desktop/ |
+| Redis | Signal storage backend, if not using Docker | https://redis.io/docs/latest/operate/oss_and_stack/install/install-redis/ |
+| ONNX | Model format used by the inference engine | https://onnx.ai/ |
+
+Useful documentation:
+
+- Actix Web: https://actix.rs/
+- Redis Docker image: https://hub.docker.com/_/redis
+- ONNX Runtime Rust crate: https://crates.io/crates/ort
+- scikit-learn: https://scikit-learn.org/stable/install.html
+- skl2onnx: https://onnx.ai/sklearn-onnx/
+
+## Project Layout
 
 ```text
-Phase 1: Read market data
-        |
-        v
-Phase 2: Build the order book
-        |
-        v
-Phase 3: Create useful features
-        |
-        v
-Phase 4: Train/export the AI model
-        |
-        v
-Phase 5: Run the AI signal engine
-        |
-        v
-Phase 6: Execution engine, future work
+hft_mvp_updated/
+  src/
+    main.rs                         # Starts backend, API, model, Redis, and frontend serving
+    api/signal_handlers.rs          # /health, /predict, /signal, /signal/history, /model/info
+    signal_engine/                  # ONNX loading, inference, signal generation, prediction store
+    features/                       # Feature formulas, rolling window, feature vectors
+    market_data/                    # CSV/tick/order book adapters
+    orderbook/                      # Order book levels and metrics
+    redis/redis_client.rs           # Redis read/write layer
+  frontend/
+    index.html                      # Dashboard UI
+    script.js                       # Calls backend at http://localhost:8080
+    style.css                       # Dashboard styling
+  ml/models/
+    best_model.onnx                 # Bundled ONNX model artifact
+    scaler.json                     # Bundled scaler artifact
+  create_test_model.py              # Creates a minimal test model
+  export_features.py                # Converts tick CSV into model feature rows
+  export_scaler.py                  # Exports sklearn scaler/model artifacts
+```
+
+## Pipeline Overview
+
+The project is organized as a trading-signal pipeline:
+
+```text
+Raw market data
+      |
+      v
+Tick parser and LOB adapter
+      |
+      v
+Order book reconstruction
+      |
+      v
+Feature engineering
+      |
+      v
+ONNX model inference
+      |
+      v
+Signal rules: BUY / SELL / HOLD
+      |
+      v
+Redis + in-memory prediction store
+      |
+      v
+REST API + frontend dashboard
 ```
 
 ### Phase 1 - Market Data
 
-This phase reads raw market data from a CSV file and turns it into clean Rust objects that the rest of the system can understand.
-
-```text
-CSV file
-   |
-   v
-Tick parser
-   |
-   v
-Clean Tick data
-```
+Raw tick/order-book rows are loaded from CSV and converted into typed Rust structures.
 
 Main files:
 
-| File | What It Does |
-|------|--------------|
-| `src/market_data/tick.rs` | Defines one market update, called a `Tick`. |
-| `src/market_data/lob_adapter.rs` | Converts CSV order-book columns into useful market data. |
-| `src/market_data/handler.rs` | Loads and sorts the market data. |
-
-Plain-English result: the app can read market rows such as prices, sizes, bids, and asks.
+| File | Purpose |
+|------|---------|
+| `src/market_data/tick.rs` | Defines a market tick. |
+| `src/market_data/lob_adapter.rs` | Converts level-2 CSV columns into order-book data. |
+| `src/market_data/handler.rs` | Loads, sorts, and serves market rows. |
 
 ### Phase 2 - Order Book
 
-This phase organizes market data into an order book. An order book is the live list of people willing to buy and sell at different prices.
-
-```text
-Clean Tick data
-   |
-   v
-OrderBook
-   |
-   v
-Best bid, best ask, spread, depth
-```
+Bid and ask levels are organized into an order book so the system can calculate market shape.
 
 Main files:
 
-| File | What It Does |
-|------|--------------|
-| `src/orderbook/level.rs` | Represents one price level in the book. |
-| `src/orderbook/order_book.rs` | Stores bid and ask levels. |
-| `src/orderbook/metrics.rs` | Calculates order-book measurements. |
-
-Plain-English result: the app can understand the current market shape, not just one raw row.
+| File | Purpose |
+|------|---------|
+| `src/orderbook/level.rs` | One price/quantity level. |
+| `src/orderbook/order_book.rs` | Bid/ask book structure. |
+| `src/orderbook/metrics.rs` | Spread, depth, imbalance, and related metrics. |
 
 ### Phase 3 - Feature Engineering
 
-This phase turns order-book data into numbers that the AI model can use.
+Order-book state is transformed into model-ready numeric features.
 
-Examples of features:
+Features include:
 
 - spread
 - mid price
@@ -100,221 +121,273 @@ Examples of features:
 - rolling volatility
 - momentum
 - liquidity ratio
+- volume imbalance
 - trade intensity
-
-```text
-OrderBook data
-   |
-   v
-FeatureEngine
-   |
-   v
-FeatureVector
-```
+- bid volume
+- ask volume
+- total liquidity
 
 Main files:
 
-| File | What It Does |
-|------|--------------|
-| `src/features/calculators.rs` | Small formulas for market measurements. |
-| `src/features/rolling_window.rs` | Keeps recent values so moving calculations can be made. |
-| `src/features/feature_vector.rs` | Defines the final list of numbers sent to the model. |
-| `src/features/feature_engine.rs` | Combines all calculations into one feature engine. |
-
-Plain-English result: the app creates the exact input numbers the AI model expects.
+| File | Purpose |
+|------|---------|
+| `src/features/calculators.rs` | Small reusable feature formulas. |
+| `src/features/rolling_window.rs` | Rolling buffer used for volatility and momentum. |
+| `src/features/feature_vector.rs` | Feature vector shape used by earlier feature APIs. |
+| `src/features/feature_engine.rs` | Combines raw book data into features. |
+| `src/signal_engine/inference.rs` | Defines the API `FeatureVector` consumed by `/predict`. |
 
 ### Phase 4 - Model Training and Export
 
-This phase happens mostly outside the Rust app. A model is trained in Python, then exported into files the Rust app can load.
+Training happens in Python. The trained model and scaler are exported into artifacts the Rust backend can load.
+
+Expected runtime artifacts:
 
 ```text
-Training data
-   |
-   v
-Python model training
-   |
-   v
-best_model.onnx + scaler.json
+ml/models/best_model.onnx
+ml/models/scaler.json
 ```
 
-Main files in this repo:
-
-| File | What It Does |
-|------|--------------|
-| `export_scaler.py` | Converts a trained Python scaler/model into Rust-friendly files. |
-| `create_test_model.py` | Creates a small test model when the real model is not ready. |
-| `models/best_model.onnx` | The AI model file used by Phase 5. |
-| `models/scaler.json` | Tells Phase 5 how to prepare input numbers before prediction. |
-
-Plain-English result: the trained model becomes portable and can run inside the Rust backend.
-
-### Phase 5 - AI Signal Engine
-
-This is the current main app. It loads the model, receives feature data, asks the AI for a prediction, and returns a trading signal.
+Optional artifacts supported by the loader:
 
 ```text
-FeatureVector
-   |
-   v
-InferenceEngine
-   |
-   v
-BUY, SELL, or HOLD
-   |
-   v
-Redis + API response
+ml/models/feature_columns.json
+ml/models/label_encoder.json
+ml/models/training_metadata.json
+ml/models/model_metrics.json
 ```
+
+If optional files are missing, the backend uses default feature order and label mapping.
 
 Main files:
 
-| File | What It Does |
-|------|--------------|
-| `src/main.rs` | Starts Phase 5 and opens the web API. |
-| `src/signal_engine/onnx_loader.rs` | Loads the AI model and scaler. |
-| `src/signal_engine/inference.rs` | Runs the model prediction. |
-| `src/signal_engine/signal_generator.rs` | Applies the confidence rule and creates the final signal. |
+| File | Purpose |
+|------|---------|
+| `ml/notebook/hft_phase4_v2.ipynb` | Training/export notebook. |
+| `export_features.py` | Builds `data/features.csv` from `data/ticks.csv`. |
+| `export_scaler.py` | Exports sklearn scaler/model into JSON/ONNX. |
+| `create_test_model.py` | Creates a minimal local ONNX model for testing. |
+
+### Phase 5 - Signal Engine and Dashboard
+
+This is the runnable backend. It loads ONNX artifacts, connects to Redis, starts Actix Web, serves the frontend, and exposes prediction APIs.
+
+Main files:
+
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | App startup, model loading, Redis connection, routes, frontend serving. |
+| `src/signal_engine/onnx_loader.rs` | Loads ONNX session, scaler, feature columns, label encoder. |
+| `src/signal_engine/inference.rs` | Validates features, scales input, runs ONNX inference. |
+| `src/signal_engine/signal_generator.rs` | Converts inference output into final trading signal. |
 | `src/signal_engine/prediction.rs` | Keeps recent predictions in memory. |
-| `src/api/signal_handlers.rs` | Provides `/health`, `/predict`, and signal lookup URLs. |
-| `src/redis/redis_client.rs` | Saves and reads signals from Redis. |
-
-Plain-English result: the app can answer, "Based on these market numbers, should we buy, sell, or hold?"
-
-### Phase 6 - Execution Engine
-
-This phase is future work. It would read the signals from Phase 5 and decide whether to place real or simulated orders.
-
-```text
-TradingSignal
-   |
-   v
-Risk checks
-   |
-   v
-Order decision
-   |
-   v
-Broker/exchange or simulator
-```
-
-Expected future pieces:
-
-| Part | What It Would Do |
-|------|------------------|
-| Risk checks | Stop unsafe trades before they happen. |
-| Position tracking | Know what the system already owns. |
-| Order execution | Send approved orders to a broker, exchange, or simulator. |
-| Monitoring | Show whether trades and signals are behaving correctly. |
-
-Plain-English result: this would be the layer that acts on signals. It is not part of the current app yet.
-
-## Main Files
-
-| File | Plain-English Purpose |
-|------|------------------------|
-| `src/main.rs` | Starts the whole app, loads the model, connects Redis, and opens the API. |
-| `src/signal_engine/inference.rs` | Sends market features into the AI model and reads the model's answer. |
-| `src/signal_engine/signal_generator.rs` | Turns the model answer into `BUY`, `SELL`, or `HOLD`. |
-| `src/signal_engine/prediction.rs` | Keeps recent signals in memory while the app is running. |
-| `src/redis/redis_client.rs` | Saves and reads the latest signal from Redis. |
-| `src/api/signal_handlers.rs` | Defines the web URLs such as `/health`, `/predict`, and `/signal/AAPL`. |
-| `create_test_model.py` | Creates a fake test model so the app can be tested without the real trained model. |
-| `export_scaler.py` | Converts Phase 4 training files into files this Rust app can use. |
-
-## What You Need Installed
-
-- Rust, to run the backend.
-- Python, only if you need to create or export model files.
-- Redis, because the app stores the latest signal there.
-- Docker Desktop is the easiest way to run Redis on Windows.
+| `src/api/signal_handlers.rs` | REST API handlers. |
+| `src/redis/redis_client.rs` | Stores latest signal and signal history in Redis. |
+| `frontend/` | Browser dashboard served by the backend. |
 
 ## First-Time Setup
 
-### 1. Start Redis
+Open PowerShell in the project folder:
 
-Open PowerShell and run:
+```powershell
+cd C:\Users\ADMIN\Downloads\hft_mvp_updated
+```
+
+### 1. Check Rust
+
+```powershell
+rustc --version
+cargo --version
+```
+
+If these commands fail, install Rust from:
+
+```text
+https://www.rust-lang.org/tools/install
+```
+
+### 2. Start Redis
+
+Using Docker:
 
 ```powershell
 docker run -d --name redis-hft -p 6379:6379 redis:7-alpine
 ```
 
-If Docker says the name already exists, Redis may already be created. You can start it with:
+If the container already exists:
 
 ```powershell
 docker start redis-hft
 ```
 
-### 2. Create a Test Model
-
-Use this when you do not yet have the real trained model from Phase 4.
+Check Redis is reachable:
 
 ```powershell
-pip install scikit-learn skl2onnx onnx numpy
+docker exec -it redis-hft redis-cli ping
+```
+
+Expected output:
+
+```text
+PONG
+```
+
+### 3. Confirm Model Artifacts
+
+The backend defaults to:
+
+```text
+ml/models
+```
+
+Confirm the files exist:
+
+```powershell
+Get-ChildItem ml\models
+```
+
+You should see at least:
+
+```text
+best_model.onnx
+scaler.json
+```
+
+If you want to use a different model folder:
+
+```powershell
+$env:ML_DIR = "path/to/your/models"
+cargo run
+```
+
+### 4. Optional Python Setup
+
+Only needed if you want to generate features or export/create model artifacts:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install numpy pandas onnx scikit-learn skl2onnx
+```
+
+Generate `data/features.csv` from `data/ticks.csv`:
+
+```powershell
+python export_features.py
+```
+
+Create a minimal test model:
+
+```powershell
 python create_test_model.py
 ```
 
-This creates:
+Note: `create_test_model.py` currently writes to `models/`. Either run with:
 
-- `models/best_model.onnx`
-- `models/scaler.json`
+```powershell
+$env:ML_DIR = "models"
+cargo run
+```
 
-These files let the app start and let tests run.
+or copy the generated files into `ml/models`.
 
-### 3. Run the App
+## Run The Project
+
+Start Redis first, then run:
 
 ```powershell
 cargo run
 ```
 
-For a faster production-style run:
+For a release build:
 
 ```powershell
 cargo run --release
 ```
 
-When it starts successfully, the app listens at:
+The backend listens at:
 
 ```text
 http://localhost:8080
 ```
 
-## Using the App
+The dashboard is served by the backend:
 
-### Check If It Is Running
+```text
+http://localhost:8080/
+```
 
-Open this in a browser:
+The frontend JavaScript calls:
 
 ```text
 http://localhost:8080/health
+http://localhost:8080/predict
+http://localhost:8080/signal/history/BTCUSDT?limit=20
 ```
 
-You should see a response showing whether the app and Redis are healthy.
+If you open `frontend/index.html` separately through VS Code Live Server, the frontend still calls `http://localhost:8080`, so the Rust backend must be running on port `8080`.
 
-### Ask for a Prediction
+## API Endpoints
 
-Send market feature data to:
+### Health
+
+```text
+GET http://localhost:8080/health
+```
+
+Returns backend status, model version, prediction count, and symbol count.
+
+### Predict
 
 ```text
 POST http://localhost:8080/predict
 ```
 
-Example request:
+Example body:
 
 ```json
 {
   "timestamp": 1718000000000,
-  "symbol": "AAPL",
-  "spread": 0.01,
-  "mid_price": 150.0,
-  "order_book_imbalance": 0.2,
-  "rolling_volatility": 0.05,
-  "momentum": 0.03,
-  "liquidity_ratio": 1.5,
-  "volume_imbalance": 0.1,
-  "trade_intensity": 120.0,
-  "bid_volume": 1000.0,
-  "ask_volume": 900.0,
-  "total_liquidity": 1900.0
+  "symbol": "BTCUSDT",
+  "spread": 1.0,
+  "mid_price": 30000.0,
+  "order_book_imbalance": 0.1,
+  "rolling_volatility": 0.002,
+  "momentum": 0.001,
+  "liquidity_ratio": 1.2,
+  "volume_imbalance": 0.05,
+  "trade_intensity": 80.0,
+  "bid_volume": 1200.0,
+  "ask_volume": 1000.0,
+  "total_liquidity": 2200.0
 }
+```
+
+Example PowerShell request:
+
+```powershell
+$body = @{
+  timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  symbol = "BTCUSDT"
+  spread = 1.0
+  mid_price = 30000.0
+  order_book_imbalance = 0.1
+  rolling_volatility = 0.002
+  momentum = 0.001
+  liquidity_ratio = 1.2
+  volume_imbalance = 0.05
+  trade_intensity = 80.0
+  bid_volume = 1200.0
+  ask_volume = 1000.0
+  total_liquidity = 2200.0
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body `
+  "http://localhost:8080/predict"
 ```
 
 Example response:
@@ -323,89 +396,155 @@ Example response:
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "timestamp": 1718000000000,
-  "symbol": "AAPL",
-  "signal": "BUY",
-  "confidence": 0.87,
-  "prob_sell": 0.05,
-  "prob_hold": 0.08,
-  "prob_buy": 0.87,
-  "model_version": "v1718000000",
+  "symbol": "BTCUSDT",
+  "signal": "HOLD",
+  "confidence": 0.6,
+  "prob_sell": 0.2,
+  "prob_hold": 0.6,
+  "prob_buy": 0.2,
+  "model_version": "v1782781833",
   "inference_ms": 2.4,
-  "is_actionable": true
+  "is_actionable": false
 }
 ```
 
-### Read the Latest Signal
+### Latest Signal
 
 ```text
-GET http://localhost:8080/signal/AAPL
+GET http://localhost:8080/signal/BTCUSDT
 ```
 
-This returns the latest stored signal for `AAPL`.
+Returns the latest signal stored for `BTCUSDT`.
 
-### Read Signal History
+### Signal History
 
 ```text
-GET http://localhost:8080/signal/history/AAPL?limit=20
+GET http://localhost:8080/signal/history/BTCUSDT?limit=20
 ```
 
-This returns recent signals for `AAPL`, newest first.
+Returns recent predictions for `BTCUSDT`, newest first.
+
+### Model Info
+
+```text
+GET http://localhost:8080/model/info
+```
+
+Returns loaded metadata, feature order, and active model version.
 
 ## How Signals Are Decided
 
 The model returns probabilities for `SELL`, `HOLD`, and `BUY`.
 
-The app only allows a real `BUY` or `SELL` when confidence is above `0.70`.
+The app only emits an actionable `BUY` or `SELL` when:
 
-| Model Result | Confidence | Final Signal |
-|--------------|------------|--------------|
-| BUY | More than 0.70 | BUY |
-| SELL | More than 0.70 | SELL |
-| BUY or SELL | 0.70 or lower | HOLD |
-| HOLD | Any confidence | HOLD |
-
-This makes the app conservative. When the model is unsure, it chooses `HOLD`.
-
-## Using a Real Trained Model
-
-If Phase 4 already produced trained files, use:
-
-```powershell
-pip install scikit-learn skl2onnx onnx numpy
-python export_scaler.py `
-  --scaler-pkl ../phase4/ml/models/scaler.pkl `
-  --scaler-json ./models/scaler.json `
-  --model-pkl ../phase4/ml/models/best_model.pkl `
-  --onnx-path ./models/best_model.onnx
+```text
+confidence > 0.70
 ```
 
-After this, run:
+Decision table:
+
+| Model Output | Confidence | Final Signal |
+|--------------|------------|--------------|
+| BUY | Greater than 0.70 | BUY |
+| SELL | Greater than 0.70 | SELL |
+| BUY | 0.70 or lower | HOLD |
+| SELL | 0.70 or lower | HOLD |
+| HOLD | Any confidence | HOLD |
+
+This makes the engine conservative. When the model is unsure, the API returns `HOLD`.
+
+## Frontend Dashboard
+
+The dashboard shows:
+
+- backend, Redis, and model status
+- simulated live market values
+- top bid/ask table
+- generated feature vector values
+- AI signal and probabilities
+- recent prediction history
+
+The frontend currently generates a live-looking `BTCUSDT` feature vector in the browser and posts it to `/predict` once per second. The backend performs real ONNX inference and stores the resulting signal.
+
+Open:
+
+```text
+http://localhost:8080/
+```
+
+If the dashboard says it cannot reach the backend:
+
+1. Confirm this works in the browser:
+
+   ```text
+   http://localhost:8080/health
+   ```
+
+2. Confirm port `8080` is not occupied by an old server:
+
+   ```powershell
+   netstat -ano | findstr :8080
+   ```
+
+3. Stop the old process if needed:
+
+   ```powershell
+   Stop-Process -Id <PID> -Force
+   ```
+
+4. Restart:
+
+   ```powershell
+   cargo run
+   ```
+
+5. Hard refresh the browser:
+
+   ```text
+   Ctrl + F5
+   ```
+
+## Exporting A Real Model
+
+If your training pipeline produced sklearn artifacts, export them into the runtime model folder:
+
+```powershell
+python export_scaler.py `
+  --scaler-pkl path\to\scaler.pkl `
+  --scaler-json ml\models\scaler.json `
+  --model-pkl path\to\best_model.pkl `
+  --onnx-path ml\models\best_model.onnx `
+  --n-features 12
+```
+
+Then run:
 
 ```powershell
 cargo run --release
 ```
 
-## Running Tests
+## Tests
 
-To check that the code is working:
+Run:
 
 ```powershell
 cargo test
 ```
 
-Current expected result:
+Run compile checks:
 
-```text
-70 passed, 0 failed, 1 ignored
+```powershell
+cargo check
 ```
 
-The ignored test is a Redis integration test that is only meant to run when Redis is available and you explicitly ask for it.
+Some Redis integration tests may be marked ignored because they require a running Redis instance.
 
 ## Common Problems
 
-### Redis is not running
+### Redis connection failed
 
-Start it:
+Start Redis:
 
 ```powershell
 docker start redis-hft
@@ -417,51 +556,66 @@ Or recreate it:
 docker run -d --name redis-hft -p 6379:6379 redis:7-alpine
 ```
 
-### Model file is missing
+### Model file missing
 
-Create a test model:
+The backend looks in `ml/models` by default.
 
-```powershell
-python create_test_model.py
-```
-
-Then confirm these files exist:
-
-```text
-models/best_model.onnx
-models/scaler.json
-```
-
-### Port 8080 is already in use
-
-Run the app on another port:
+Check:
 
 ```powershell
-$env:BIND_ADDR = "0.0.0.0:8081"
+Get-ChildItem ml\models
+```
+
+If your model is in another folder:
+
+```powershell
+$env:ML_DIR = "models"
+cargo run
+```
+
+### Port 8080 already in use
+
+Find the process:
+
+```powershell
+netstat -ano | findstr :8080
+```
+
+Stop it:
+
+```powershell
+Stop-Process -Id <PID> -Force
+```
+
+Or run on another port:
+
+```powershell
+$env:BIND_ADDR = "127.0.0.1:8081"
 cargo run
 ```
 
 Then open:
 
 ```text
-http://localhost:8081/health
+http://localhost:8081/
 ```
 
-## Simple Flow
+### Frontend cannot reach backend
+
+Make sure `frontend/script.js` points to:
+
+```js
+const API_BASE_URL = "http://localhost:8080";
+```
+
+Then confirm:
 
 ```text
-Market numbers go in
-        |
-        v
-AI model checks them
-        |
-        v
-App chooses BUY, SELL, or HOLD
-        |
-        v
-Signal is saved in Redis and returned by the API
+http://localhost:8080/health
 ```
+
+If that works, hard refresh the browser with `Ctrl + F5`.
 
 ## Important Note
 
-This project is for software development and testing. It is not financial advice, and it should not be connected to real trading without proper risk controls, monitoring, and review.
+This project is for software development, local testing, and demonstration. It is not financial advice and should not be connected to real trading without risk controls, monitoring, compliance review, and a tested execution layer.
