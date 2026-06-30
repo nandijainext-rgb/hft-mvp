@@ -3,9 +3,11 @@ use redis::{aio::ConnectionManager, AsyncCommands, Client};
 use tracing::{debug, warn};
 
 use crate::features::FeatureVector;
+use crate::signal_engine::signal_generator::TradingSignal;
 
 /// Max history entries kept per symbol in a Redis List.
 const HISTORY_MAX_LEN: isize = 100;
+const SIGNAL_HISTORY_MAX_LEN: isize = 1000;
 
 /// Async Redis client that stores and retrieves feature vectors.
 ///
@@ -59,6 +61,25 @@ impl RedisClient {
         Ok(())
     }
 
+    /// Store the latest trading signal and append it to a capped Redis history.
+    ///
+    /// Key schema:
+    ///   `signal:{symbol}`         -> JSON string for the latest signal
+    ///   `signal:{symbol}:history` -> List of recent signal JSON payloads
+    pub async fn store_signal(&self, signal: &TradingSignal) -> Result<()> {
+        let key = format!("signal:{}", signal.symbol.to_uppercase());
+        let history_key = format!("{key}:history");
+        let json = serde_json::to_string(signal)?;
+        let mut conn = self.conn.clone();
+
+        let _: () = conn.set(&key, &json).await?;
+        let _: () = conn.lpush(&history_key, &json).await?;
+        let _: () = conn.ltrim(&history_key, 0, SIGNAL_HISTORY_MAX_LEN - 1).await?;
+
+        debug!(key = %key, "Trading signal stored");
+        Ok(())
+    }
+
     // ── Read ──────────────────────────────────────────────────────────────────
 
     /// Retrieve the latest feature vector for a symbol (from the Hash).
@@ -99,6 +120,16 @@ impl RedisClient {
         Ok(Some(lf))
     }
 
+    /// Retrieve the latest stored trading signal for a symbol.
+    pub async fn get_signal(&self, symbol: &str) -> Result<Option<TradingSignal>> {
+        let key = format!("signal:{}", symbol.to_uppercase());
+        let mut conn = self.conn.clone();
+        let raw: Option<String> = conn.get(&key).await?;
+
+        raw.map(|value| serde_json::from_str::<TradingSignal>(&value).map_err(Into::into))
+            .transpose()
+    }
+
     /// Retrieve last N feature vectors for a symbol (from the history List).
     /// Returns newest-first. Returns `[]` if symbol unknown.
     pub async fn get_history(&mut self, symbol: &str, n: isize) -> Result<Vec<FeatureVector>> {
@@ -131,6 +162,17 @@ impl RedisClient {
             Ok(s) if s == "PONG" => true,
             Ok(s) => { warn!(resp = %s, "Unexpected PING response"); false }
             Err(e) => { warn!(error = %e, "Redis PING failed"); false }
+        }
+    }
+
+    /// Shared-client ping used by Phase 5 handlers.
+    pub async fn ping_shared(&self) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let response: String = redis::cmd("PING").query_async(&mut conn).await?;
+        if response == "PONG" {
+            Ok(())
+        } else {
+            anyhow::bail!("Unexpected PING response: {response}");
         }
     }
 }

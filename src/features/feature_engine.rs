@@ -236,6 +236,7 @@ impl Default for FeatureEngineRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::calculators::order_book_imbalance;
     use chrono::Utc;
 
     fn snap(bid: f64, ask: f64, bid_vol: f64, ask_vol: f64) -> OrderBookSnapshot {

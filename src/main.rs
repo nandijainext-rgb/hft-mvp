@@ -1,202 +1,152 @@
-// ── Phase 3: Feature Engineering Engine ──────────────────────────────────────
-//
-// Architecture:
-//   Phase 2 tick feed  →  OrderBookSnapshot channel
-//      ↓
-//   FeatureEngineRegistry  (per-symbol rolling windows)
-//      ↓ FeatureVector
-//   RedisClient  (latest Hash + history List)
-//      ↓
-//   Actix-Web API  (GET /features/{symbol}, /history, /stats)
-//
-// This binary is self-contained and can run alongside the Phase 2 binary,
-// consuming its Redis snapshots and re-emitting richer feature data.
-//
-// For integration into a single binary, move the `features` module into the
-// Phase 2 crate and wire it into the consumer task in main.rs.
-// ─────────────────────────────────────────────────────────────────────────────
+// src/main.rs
+// Phase 5 - HFT AI Signal Engine
+// Loads the ONNX model once, runs inference, publishes signals to Redis, and
+// serves the REST API.
 
 mod api;
 mod features;
 mod redis;
+mod signal_engine;
 
-use actix_web::{web, App, HttpServer};
-use anyhow::Result;
-use parking_lot::Mutex;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use api::{get_feature_history, get_feature_stats, get_latest_features, health};
-use features::{FeatureEngineRegistry, OrderBookSnapshot};
-use redis::RedisClient;
+use actix_web::{
+    http::Method,
+    middleware::DefaultHeaders,
+    web, App, HttpResponse, HttpServer, Responder,
+};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
-// ─── Simulated tick feed ──────────────────────────────────────────────────────
-//
-// In production this task would subscribe to the Phase 2 broadcast channel.
-// Here we simulate by reading from Redis (Phase 2 writes `orderbook:{symbol}`)
-// so Phase 3 can run standalone without code changes to Phase 2.
+use api::signal_handlers;
+use redis::redis_client::RedisClient;
+use signal_engine::inference::InferenceEngine;
+use signal_engine::model_metadata::ModelMetadata;
+use signal_engine::prediction::PredictionStore;
 
-async fn run_feature_consumer(
-    redis_url: String,
-    symbols: Vec<String>,
-    mut store_client: RedisClient,
-) -> Result<()> {
-    use std::time::Duration;
-    use tokio::time::sleep;
-
-    let mut registry = FeatureEngineRegistry::new();
-
-    // Phase 2 Redis client for reading snapshots
-    let mut reader = RedisClient::new(&redis_url).await?;
-
-    info!(symbols = ?symbols, "Feature consumer starting");
-
-    loop {
-        for symbol in &symbols {
-            // Read the latest Phase 2 snapshot from Redis
-            let snap: Option<OrderBookSnapshot> = read_phase2_snapshot(&mut reader, symbol).await;
-
-            if let Some(s) = snap {
-                let fv = registry.process(&s);
-
-                // Store feature vector
-                if let Err(e) = store_client.store_features(&fv).await {
-                    warn!(error = %e, symbol, "Failed to store feature vector");
-                }
-
-                info!(
-                    symbol = %fv.symbol,
-                    mid = fv.mid_price,
-                    spread = fv.spread,
-                    obi = fv.order_book_imbalance,
-                    vol = ?fv.rolling_volatility,
-                    mom = ?fv.momentum,
-                    intensity = fv.trade_intensity,
-                    "Feature vector"
-                );
-            }
-        }
-
-        sleep(Duration::from_millis(10)).await;
-    }
+/// Shared application state injected into every Actix handler.
+pub struct AppState {
+    pub inference_engine: Arc<InferenceEngine>,
+    pub prediction_store: Arc<PredictionStore>,
+    pub redis_client: Arc<RedisClient>,
+    pub model_metadata: Arc<ModelMetadata>,
 }
-
-/// Read a Phase 2 `orderbook:{symbol}` Redis Hash and convert to an
-/// `OrderBookSnapshot` for the feature engine.
-async fn read_phase2_snapshot(
-    client: &mut RedisClient,
-    symbol: &str,
-) -> Option<OrderBookSnapshot> {
-    use chrono::Utc;
-
-    // We reach into the underlying connection via a helper ping/get.
-    // In a real integration you'd have a typed method on RedisClient.
-    // For now, use the public ping check as a liveliness guard.
-    if !client.ping().await {
-        return None;
-    }
-
-    // For standalone testing, synthesise a snapshot so the binary is runnable
-    // without Phase 2 actually being up. Replace this block with a proper
-    // HGETALL when integrating.
-    let obi = rand_f64(-0.5, 0.5);
-    Some(OrderBookSnapshot {
-        timestamp: Utc::now(),
-        symbol: symbol.to_uppercase(),
-        best_bid: 30000.0 + rand_f64(-50.0, 50.0),
-        best_ask: 30001.0 + rand_f64(-50.0, 50.0),
-        bid_volume: rand_f64(0.5, 5.0),
-        ask_volume: rand_f64(0.5, 5.0),
-        order_book_imbalance: obi,
-    })
-}
-
-/// Cheap pseudo-random helper (no dependencies needed).
-fn rand_f64(lo: f64, hi: f64) -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos() as f64;
-    lo + (nanos % 1_000_000.0) / 1_000_000.0 * (hi - lo)
-}
-
-// ─── Entry point ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+async fn main() -> anyhow::Result<()> {
+    let _ = dotenv::dotenv();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(true)
         .with_thread_ids(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+        .init();
 
-    dotenv::dotenv().ok();
+    info!("HFT Signal Engine - Phase 5 starting");
 
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let api_bind = std::env::var("API_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:8081".into()); // 8081 to avoid clash with Phase 2
-    let symbols: Vec<String> = std::env::var("SYMBOLS")
-        .unwrap_or_else(|_| "BTCUSDT".into())
-        .split(',')
-        .map(str::trim)
-        .map(str::to_uppercase)
-        .collect();
+    let ml_dir = std::env::var("ML_DIR").unwrap_or_else(|_| default_project_path("ml/models"));
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
-    info!(redis = %redis_url, bind = %api_bind, symbols = ?symbols, "Phase 3 Feature Engine starting");
+    info!("Loading ONNX model artifacts from: {}", ml_dir);
+    let inference_engine = Arc::new(
+        InferenceEngine::new(&ml_dir).map_err(|e| {
+            error!("Failed to load ONNX model: {}", e);
+            e
+        })?,
+    );
+    info!("ONNX model loaded successfully");
+    let model_metadata = Arc::new(ModelMetadata::load(&ml_dir));
 
-    // ── Redis clients ─────────────────────────────────────────────────────────
-    let store_client = match RedisClient::new(&redis_url).await {
-        Ok(c) => {
-            info!("Redis connected (feature store)");
-            c
-        }
-        Err(e) => {
-            error!(error = %e, "Cannot connect to Redis — aborting");
-            anyhow::bail!("Redis required for Phase 3: {e}");
-        }
-    };
+    let prediction_store = Arc::new(PredictionStore::new(1000));
 
-    let api_client = match RedisClient::new(&redis_url).await {
-        Ok(c) => c,
-        Err(e) => anyhow::bail!("Redis API client failed: {e}"),
-    };
+    info!("Connecting to Redis: {}", redis_url);
+    let redis_client = Arc::new(RedisClient::new(&redis_url).await.map_err(|e| {
+        error!("Failed to connect to Redis: {}", e);
+        e
+    })?);
+    info!("Redis connected");
 
-    // ── Feature consumer task ─────────────────────────────────────────────────
-    let consumer_handle = {
-        let redis_url = redis_url.clone();
-        let symbols = symbols.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_feature_consumer(redis_url, symbols, store_client).await {
-                error!(error = %e, "Feature consumer crashed");
-            }
-        })
-    };
+    let state = web::Data::new(AppState {
+        inference_engine,
+        prediction_store,
+        redis_client,
+        model_metadata,
+    });
 
-    // ── HTTP API ──────────────────────────────────────────────────────────────
-    let shared_redis = web::Data::new(Mutex::new(api_client));
-    let api_bind_clone = api_bind.clone();
-
-    let server = HttpServer::new(move || {
+    info!("Starting HTTP server on {}", bind_addr);
+    HttpServer::new(move || {
         App::new()
-            .app_data(shared_redis.clone())
-            .service(health)
-            .service(get_latest_features)
-            .service(get_feature_history)
-            .service(get_feature_stats)
+            .wrap(
+                DefaultHeaders::new()
+                    .add(("Access-Control-Allow-Origin", "*"))
+                    .add(("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
+                    .add(("Access-Control-Allow-Headers", "Content-Type")),
+            )
+            .app_data(state.clone())
+            .app_data(web::JsonConfig::default().error_handler(|err, req| {
+                let msg = format!("JSON parse error: {}", err);
+                tracing::warn!("{} - path: {}", msg, req.path());
+                actix_web::error::InternalError::from_response(
+                    err,
+                    actix_web::HttpResponse::BadRequest()
+                        .json(serde_json::json!({ "error": msg })),
+                )
+                .into()
+            }))
+            .route("/health", web::get().to(signal_handlers::health))
+            .route("/predict", web::post().to(signal_handlers::predict))
+            .route("/signal/{symbol}", web::get().to(signal_handlers::get_signal))
+            .route(
+                "/signal/history/{symbol}",
+                web::get().to(signal_handlers::get_signal_history),
+            )
+            .route("/model/info", web::get().to(signal_handlers::model_info))
+            .route("/", web::get().to(frontend_index))
+            .route("/index.html", web::get().to(frontend_index))
+            .route("/script.js", web::get().to(frontend_script))
+            .route("/style.css", web::get().to(frontend_style))
+            .route(
+                "/{tail:.*}",
+                web::method(Method::OPTIONS).to(cors_preflight),
+            )
     })
-    .bind(&api_bind)?
-    .run();
-
-    info!(bind = %api_bind_clone, "HTTP API listening");
-
-    tokio::select! {
-        _ = consumer_handle => info!("Consumer task exited"),
-        r = server => { r?; info!("HTTP server stopped"); }
-        _ = tokio::signal::ctrl_c() => info!("SIGINT — shutting down"),
-    }
+    .bind(&bind_addr)?
+    .run()
+    .await?;
 
     Ok(())
+}
+
+async fn cors_preflight() -> impl Responder {
+    HttpResponse::NoContent().finish()
+}
+
+async fn frontend_index() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(include_str!("../frontend/index.html"))
+}
+
+async fn frontend_script() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("application/javascript; charset=utf-8")
+        .body(include_str!("../frontend/script.js"))
+}
+
+async fn frontend_style() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("text/css; charset=utf-8")
+        .body(include_str!("../frontend/style.css"))
+}
+
+fn default_project_path(relative_path: &str) -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(relative_path)
+        .to_string_lossy()
+        .into_owned()
 }
